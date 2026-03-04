@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { schema } from './schema';
 import { runMigrations } from './migrations';
+import { startReconciler } from '@/lib/reconciler';
 
 const DB_PATH = process.env.DATABASE_PATH || path.join(process.cwd(), 'mission-control.db');
 
@@ -26,6 +27,9 @@ export function getDb(): Database.Database {
     if (isNewDb) {
       console.log('[DB] New database created at:', DB_PATH);
     }
+
+    // Start the reconciler loop (singleton — safe for hot-reload)
+    startReconciler();
   }
   return db;
 }

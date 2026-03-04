@@ -621,6 +621,30 @@ const migrations: Migration[] = [
 
       console.log('[Migration 013] Fresh start complete');
     }
+  },
+  {
+    id: '014',
+    name: 'add_retry_and_dispatch_lock_columns',
+    up: (db) => {
+      console.log('[Migration 014] Adding retry_count, next_retry_at, dispatch_lock columns to tasks...');
+
+      const tasksInfo = db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[];
+
+      if (!tasksInfo.some(col => col.name === 'retry_count')) {
+        db.exec(`ALTER TABLE tasks ADD COLUMN retry_count INTEGER DEFAULT 0`);
+        console.log('[Migration 014] Added retry_count to tasks');
+      }
+
+      if (!tasksInfo.some(col => col.name === 'next_retry_at')) {
+        db.exec(`ALTER TABLE tasks ADD COLUMN next_retry_at TEXT`);
+        console.log('[Migration 014] Added next_retry_at to tasks');
+      }
+
+      if (!tasksInfo.some(col => col.name === 'dispatch_lock')) {
+        db.exec(`ALTER TABLE tasks ADD COLUMN dispatch_lock TEXT`);
+        console.log('[Migration 014] Added dispatch_lock to tasks');
+      }
+    }
   }
 ];
 

@@ -71,6 +71,10 @@ export interface Task {
   planning_complete?: number;
   planning_dispatch_error?: string;
   planning_session_key?: string;
+  // Retry/dispatch reliability columns (migration 014)
+  retry_count?: number;
+  next_retry_at?: string | null;
+  dispatch_lock?: string | null;
   created_at: string;
   updated_at: string;
   // Joined fields

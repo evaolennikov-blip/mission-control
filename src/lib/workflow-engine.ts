@@ -5,10 +5,13 @@
  * and fail-loopback logic for multi-agent task workflows.
  */
 
-import { queryOne, queryAll, run } from '@/lib/db';
+import { queryOne, queryAll, run, transaction } from '@/lib/db';
 import { getMissionControlUrl } from '@/lib/config';
 import { broadcast } from '@/lib/events';
+import { getFileWorkflowConfig } from '@/lib/workflow-loader';
 import type { Task, WorkflowTemplate, WorkflowStage, TaskRole } from '@/lib/types';
+
+const DEFAULT_MAX_CONCURRENT = 3;
 
 interface StageTransitionResult {
   success: boolean;
@@ -16,6 +19,14 @@ interface StageTransitionResult {
   newAgentId?: string;
   newAgentName?: string;
   error?: string;
+}
+
+/**
+ * Get the max concurrent tasks from WORKFLOW.md config, or default.
+ */
+export function getConcurrencyLimit(): number {
+  const fileConfig = getFileWorkflowConfig();
+  return fileConfig?.agent?.max_concurrent_tasks || DEFAULT_MAX_CONCURRENT;
 }
 
 /**
@@ -28,7 +39,7 @@ export function getTaskWorkflow(taskId: string): WorkflowTemplate | null {
   );
   if (!task) return null;
 
-  // Try task-specific template first
+  // Try task-specific template first (explicit override)
   if (task.workflow_template_id) {
     const tpl = queryOne<{ id: string; workspace_id: string; name: string; description: string; stages: string; fail_targets: string; is_default: number; created_at: string; updated_at: string }>(
       'SELECT * FROM workflow_templates WHERE id = ?',
@@ -37,7 +48,23 @@ export function getTaskWorkflow(taskId: string): WorkflowTemplate | null {
     if (tpl) return parseTemplate(tpl);
   }
 
-  // Fall back to workspace default
+  // Try WORKFLOW.md file-based config (Symphony pattern)
+  const fileConfig = getFileWorkflowConfig();
+  if (fileConfig) {
+    return {
+      id: 'file:WORKFLOW.md',
+      workspace_id: task.workspace_id,
+      name: fileConfig.name,
+      description: fileConfig.body.slice(0, 200),
+      stages: fileConfig.stages,
+      fail_targets: fileConfig.fail_targets,
+      is_default: fileConfig.default,
+      created_at: '',
+      updated_at: '',
+    };
+  }
+
+  // Fall back to workspace default in DB
   const tpl = queryOne<{ id: string; workspace_id: string; name: string; description: string; stages: string; fail_targets: string; is_default: number; created_at: string; updated_at: string }>(
     'SELECT * FROM workflow_templates WHERE workspace_id = ? AND is_default = 1 LIMIT 1',
     [task.workspace_id]
@@ -133,59 +160,107 @@ export async function handleStageTransition(
     return { success: true, handedOff: false };
   }
 
-  // Find the agent assigned to this role (task_roles first, then fall back to assigned_agent_id)
-  let roleAgent = getAgentForRole(taskId, targetStage.role);
-  if (!roleAgent) {
-    // Fall back to the task's directly assigned agent
-    const task = queryOne<{ assigned_agent_id: string | null }>(
-      'SELECT assigned_agent_id FROM tasks WHERE id = ?',
-      [taskId]
-    );
-    if (task?.assigned_agent_id) {
-      const agent = queryOne<{ id: string; name: string }>(
-        'SELECT id, name FROM agents WHERE id = ?',
-        [task.assigned_agent_id]
+  // --- Concurrency check: don't dispatch if workspace is at capacity ---
+  if (!options?.skipDispatch) {
+    const task = queryOne<{ workspace_id: string }>('SELECT workspace_id FROM tasks WHERE id = ?', [taskId]);
+    if (task) {
+      const maxConcurrent = getConcurrencyLimit();
+      const activeCount = queryOne<{ count: number }>(
+        `SELECT COUNT(*) as count FROM tasks
+         WHERE workspace_id = ? AND status IN ('assigned', 'in_progress', 'testing', 'verification')
+         AND id != ?`,
+        [task.workspace_id, taskId]
       );
-      if (agent) {
-        console.log(`[Workflow] No task_role for "${targetStage.role}", using assigned agent "${agent.name}"`);
-        roleAgent = agent;
+      if (activeCount && activeCount.count >= maxConcurrent) {
+        console.log(`[Workflow] Concurrency limit reached (${activeCount.count}/${maxConcurrent}) — task ${taskId} will wait`);
+        return { success: true, handedOff: false };
       }
     }
   }
-  if (!roleAgent) {
-    // No agent for this role — record error but don't block status change
-    const errorMsg = `No agent assigned for role: ${targetStage.role}. Assign an agent to this task.`;
-    run(
-      'UPDATE tasks SET planning_dispatch_error = ?, updated_at = datetime(\'now\') WHERE id = ?',
-      [errorMsg, taskId]
+
+  // --- Atomic section: acquire dispatch_lock + assign agent + log handoff ---
+  const now = new Date().toISOString();
+  const lockId = crypto.randomUUID();
+
+  const txResult = transaction(() => {
+    // Attempt to acquire dispatch_lock (check-and-set, prevents double-dispatch)
+    const lockResult = run(
+      'UPDATE tasks SET dispatch_lock = ? WHERE id = ? AND dispatch_lock IS NULL',
+      [lockId, taskId]
     );
-    console.warn(`[Workflow] ${errorMsg} (task ${taskId})`);
-    return { success: false, handedOff: false, error: errorMsg };
+    if (lockResult.changes === 0) {
+      // Another dispatch is already in flight
+      return { locked: false as const };
+    }
+
+    // Find the agent assigned to this role (task_roles first, then fall back to assigned_agent_id)
+    let roleAgent = getAgentForRole(taskId, targetStage.role!);
+    if (!roleAgent) {
+      // Fall back to the task's directly assigned agent
+      const task = queryOne<{ assigned_agent_id: string | null }>(
+        'SELECT assigned_agent_id FROM tasks WHERE id = ?',
+        [taskId]
+      );
+      if (task?.assigned_agent_id) {
+        const agent = queryOne<{ id: string; name: string }>(
+          'SELECT id, name FROM agents WHERE id = ?',
+          [task.assigned_agent_id]
+        );
+        if (agent) {
+          console.log(`[Workflow] No task_role for "${targetStage.role}", using assigned agent "${agent.name}"`);
+          roleAgent = agent;
+        }
+      }
+    }
+    if (!roleAgent) {
+      // No agent for this role — release lock and record error
+      const errorMsg = `No agent assigned for role: ${targetStage.role}. Assign an agent to this task.`;
+      run(
+        `UPDATE tasks SET dispatch_lock = NULL, planning_dispatch_error = ?, updated_at = ? WHERE id = ?`,
+        [errorMsg, now, taskId]
+      );
+      console.warn(`[Workflow] ${errorMsg} (task ${taskId})`);
+      return { locked: true as const, noAgent: true as const, error: errorMsg };
+    }
+
+    // Assign agent to task and clear previous errors
+    run(
+      'UPDATE tasks SET assigned_agent_id = ?, planning_dispatch_error = NULL, retry_count = 0, next_retry_at = NULL, updated_at = ? WHERE id = ?',
+      [roleAgent.id, now, taskId]
+    );
+
+    // Log the handoff
+    run(
+      `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, created_at)
+       VALUES (?, ?, ?, 'status_changed', ?, ?)`,
+      [
+        crypto.randomUUID(), taskId, roleAgent.id,
+        `Stage handoff: ${targetStage.label} → ${roleAgent.name}${options?.failReason ? ` (reason: ${options.failReason})` : ''}`,
+        now
+      ]
+    );
+
+    return { locked: true as const, noAgent: false as const, roleAgent };
+  });
+
+  if (!txResult.locked) {
+    console.log(`[Workflow] Task ${taskId} dispatch_lock already held — skipping`);
+    return { success: true, handedOff: false };
   }
 
-  // Assign agent to task
-  const now = new Date().toISOString();
-  run(
-    'UPDATE tasks SET assigned_agent_id = ?, planning_dispatch_error = NULL, updated_at = ? WHERE id = ?',
-    [roleAgent.id, now, taskId]
-  );
+  if (txResult.noAgent) {
+    return { success: false, handedOff: false, error: txResult.error };
+  }
 
-  // Log the handoff
-  run(
-    `INSERT INTO task_activities (id, task_id, agent_id, activity_type, message, created_at)
-     VALUES (?, ?, ?, 'status_changed', ?, ?)`,
-    [
-      crypto.randomUUID(), taskId, roleAgent.id,
-      `Stage handoff: ${targetStage.label} → ${roleAgent.name}${options?.failReason ? ` (reason: ${options.failReason})` : ''}`,
-      now
-    ]
-  );
+  const roleAgent = txResult.roleAgent;
 
   if (options?.skipDispatch) {
+    // Release the dispatch lock since we're not actually dispatching
+    run('UPDATE tasks SET dispatch_lock = NULL WHERE id = ?', [taskId]);
     return { success: true, handedOff: true, newAgentId: roleAgent.id, newAgentName: roleAgent.name };
   }
 
-  // Dispatch to the agent
+  // --- Dispatch to agent (outside transaction — fire-and-forget with error recording) ---
   const missionControlUrl = getMissionControlUrl();
   try {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -198,22 +273,68 @@ export async function handleStageTransition(
       headers,
     });
 
+    // Release dispatch lock regardless of outcome
+    run('UPDATE tasks SET dispatch_lock = NULL WHERE id = ?', [taskId]);
+
     if (!dispatchRes.ok) {
       const errorText = await dispatchRes.text();
       const error = `Auto-dispatch to ${roleAgent.name} failed (${dispatchRes.status}): ${errorText}`;
       console.error(`[Workflow] ${error}`);
-      run('UPDATE tasks SET planning_dispatch_error = ?, updated_at = ? WHERE id = ?', [error, now, taskId]);
+      scheduleRetry(taskId, error);
       return { success: false, handedOff: true, newAgentId: roleAgent.id, newAgentName: roleAgent.name, error };
     }
 
     console.log(`[Workflow] Dispatched task ${taskId} to ${roleAgent.name} (role: ${targetStage.role})`);
     return { success: true, handedOff: true, newAgentId: roleAgent.id, newAgentName: roleAgent.name };
   } catch (err) {
+    // Release dispatch lock on error
+    run('UPDATE tasks SET dispatch_lock = NULL WHERE id = ?', [taskId]);
     const error = `Dispatch error: ${(err as Error).message}`;
     console.error(`[Workflow] ${error}`);
-    run('UPDATE tasks SET planning_dispatch_error = ?, updated_at = ? WHERE id = ?', [error, now, taskId]);
+    scheduleRetry(taskId, error);
     return { success: false, handedOff: true, newAgentId: roleAgent.id, newAgentName: roleAgent.name, error };
   }
+}
+
+// --- Retry scheduling (Phase 2) ---
+
+const MAX_RETRIES = 5;
+const BASE_BACKOFF_MS = 10_000; // 10 seconds
+const MAX_BACKOFF_MS = 300_000; // 5 minutes
+
+/**
+ * Schedule a retry for a failed dispatch.
+ * Exponential backoff: 10s, 20s, 40s, 80s, 160s (capped at 5min).
+ * After MAX_RETRIES, marks the task with a permanent error.
+ */
+export function scheduleRetry(taskId: string, errorMsg: string): void {
+  const task = queryOne<{ retry_count: number }>(
+    'SELECT retry_count FROM tasks WHERE id = ?',
+    [taskId]
+  );
+  if (!task) return;
+
+  const newCount = (task.retry_count || 0) + 1;
+
+  if (newCount > MAX_RETRIES) {
+    const permanentError = `${errorMsg} [max retries (${MAX_RETRIES}) exceeded — manual intervention required]`;
+    run(
+      'UPDATE tasks SET planning_dispatch_error = ?, retry_count = ?, next_retry_at = NULL, updated_at = datetime(\'now\') WHERE id = ?',
+      [permanentError, newCount, taskId]
+    );
+    console.error(`[Workflow] Task ${taskId} exceeded max retries (${MAX_RETRIES})`);
+    return;
+  }
+
+  const backoffMs = Math.min(BASE_BACKOFF_MS * Math.pow(2, newCount - 1), MAX_BACKOFF_MS);
+  const nextRetryAt = new Date(Date.now() + backoffMs).toISOString();
+
+  run(
+    'UPDATE tasks SET planning_dispatch_error = ?, retry_count = ?, next_retry_at = ?, updated_at = datetime(\'now\') WHERE id = ?',
+    [errorMsg, newCount, nextRetryAt, taskId]
+  );
+
+  console.log(`[Workflow] Task ${taskId} retry ${newCount}/${MAX_RETRIES} scheduled at ${nextRetryAt} (backoff: ${backoffMs}ms)`);
 }
 
 /**
@@ -237,18 +358,24 @@ export async function handleStageFailure(
 
   const now = new Date().toISOString();
 
-  // Log the failure
-  run(
-    `INSERT INTO task_activities (id, task_id, activity_type, message, created_at)
-     VALUES (?, ?, 'status_changed', ?, ?)`,
-    [crypto.randomUUID(), taskId, `Stage failed: ${currentStatus} → ${targetStatus} (reason: ${failReason})`, now]
-  );
+  // Atomic: log failure + update status + reset retry state
+  transaction(() => {
+    run(
+      `INSERT INTO task_activities (id, task_id, activity_type, message, created_at)
+       VALUES (?, ?, 'status_changed', ?, ?)`,
+      [crypto.randomUUID(), taskId, `Stage failed: ${currentStatus} → ${targetStatus} (reason: ${failReason})`, now]
+    );
 
-  // Update task status to the fail target
-  run(
-    'UPDATE tasks SET status = ?, status_reason = ?, updated_at = ? WHERE id = ?',
-    [targetStatus, `Failed: ${failReason}`, now, taskId]
-  );
+    // Optimistic lock: only update if status hasn't changed since we read it
+    const result = run(
+      'UPDATE tasks SET status = ?, status_reason = ?, retry_count = 0, next_retry_at = NULL, updated_at = ? WHERE id = ? AND status = ?',
+      [targetStatus, `Failed: ${failReason}`, now, taskId, currentStatus]
+    );
+
+    if (result.changes === 0) {
+      console.warn(`[Workflow] Task ${taskId} status changed during failure handling — skipping`);
+    }
+  });
 
   // Broadcast update
   const updatedTask = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [taskId]);
@@ -371,7 +498,15 @@ export async function drainQueue(
     console.log(`[Workflow] Draining queue: advancing task ${oldest.id} from "${stage.label}" → "${nextStage.label}"`);
 
     const now = new Date().toISOString();
-    run('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?', [nextStage.status, now, oldest.id]);
+    // Optimistic lock: only update if still in the expected queue stage
+    const moveResult = run(
+      'UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = ?',
+      [nextStage.status, now, oldest.id, stage.status]
+    );
+    if (moveResult.changes === 0) {
+      console.log(`[Workflow] Task ${oldest.id} already moved from "${stage.status}" — skipping`);
+      continue;
+    }
 
     // Broadcast the status change
     const updated = queryOne<Task>('SELECT * FROM tasks WHERE id = ?', [oldest.id]);

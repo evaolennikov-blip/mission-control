@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { queryOne, run, queryAll } from '@/lib/db';
 import { broadcast } from '@/lib/events';
 import { getMissionControlUrl } from '@/lib/config';
-import { handleStageTransition, handleStageFailure, getTaskWorkflow, drainQueue, populateTaskRolesFromAgents } from '@/lib/workflow-engine';
+import { handleStageTransition, handleStageFailure, getTaskWorkflow, drainQueue, populateTaskRolesFromAgents, scheduleRetry } from '@/lib/workflow-engine';
 import { notifyLearner } from '@/lib/learner';
 import { UpdateTaskSchema } from '@/lib/validation';
 import type { Task, UpdateTaskRequest, Agent, TaskDeliverable } from '@/lib/types';
@@ -260,12 +260,12 @@ export async function PATCH(
             const errorText = await dispatchRes.text();
             const dispatchError = `Auto-dispatch failed (${dispatchRes.status}): ${errorText}`;
             console.error(dispatchError);
-            run('UPDATE tasks SET planning_dispatch_error = ?, updated_at = ? WHERE id = ?', [dispatchError, now, id]);
+            scheduleRetry(id, dispatchError);
           }
         } catch (err) {
           const dispatchError = `Auto-dispatch error: ${(err as Error).message}`;
           console.error(dispatchError);
-          run('UPDATE tasks SET planning_dispatch_error = ?, updated_at = ? WHERE id = ?', [dispatchError, now, id]);
+          scheduleRetry(id, dispatchError);
         }
       }
     }
@@ -320,11 +320,11 @@ export async function PATCH(
         if (!dispatchRes.ok) {
           const errorText = await dispatchRes.text();
           console.error(`[PATCH] Workflow stage dispatch failed: ${errorText}`);
-          run('UPDATE tasks SET planning_dispatch_error = ?, updated_at = ? WHERE id = ?', [`Dispatch failed (${dispatchRes.status}): ${errorText}`, now, id]);
+          scheduleRetry(id, `Dispatch failed (${dispatchRes.status}): ${errorText}`);
         }
       } catch (err) {
         console.error('[PATCH] Workflow stage dispatch error:', err);
-        run('UPDATE tasks SET planning_dispatch_error = ?, updated_at = ? WHERE id = ?', [`Dispatch error: ${(err as Error).message}`, now, id]);
+        scheduleRetry(id, `Dispatch error: ${(err as Error).message}`);
       }
       // Re-broadcast with latest state
       const refreshed = queryOne<Task>(

@@ -84,7 +84,14 @@ export function TaskModal({ task, onClose, workspaceId }: TaskModalProps) {
 
       if (!res.ok) {
         const errData = await res.json().catch(() => ({ error: 'Unknown error' }));
-        setSaveError(errData.error || `Save failed (${res.status})`);
+        if (Array.isArray(errData?.details)) {
+          const detailMessage = errData.details
+            .map((issue: { message?: string }) => issue?.message ?? '')
+            .join('; ');
+          setSaveError(detailMessage);
+        } else {
+          setSaveError(errData.error || `Save failed (${res.status})`);
+        }
         return;
       }
 
