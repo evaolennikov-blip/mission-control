@@ -174,6 +174,21 @@ async function detectStalledTasks(): Promise<void> {
       continue; // Agent is alive, just hasn't updated the task row
     }
 
+    // Check if the agent has an active OpenClaw session linked to this task
+    // If a session is active, the agent is likely still working — just hasn't logged progress
+    if (task.assigned_agent_id) {
+      const activeSession = queryOne<{ id: string; updated_at: string }>(
+        `SELECT id, updated_at FROM openclaw_sessions
+         WHERE agent_id = ? AND status = 'active' AND task_id = ?`,
+        [task.assigned_agent_id, task.id]
+      );
+      if (activeSession) {
+        // Session exists and is linked to this task — skip stall, just log a note
+        console.log(`[Reconciler] Task ${task.id} has active session — skipping stall detection`);
+        continue;
+      }
+    }
+
     console.warn(`[Reconciler] Stalled task detected: ${task.id} "${task.title}" in ${task.status} since ${task.updated_at}`);
 
     // Log a stall activity

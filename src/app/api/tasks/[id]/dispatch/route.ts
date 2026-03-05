@@ -108,9 +108,9 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       const openclawSessionId = `mission-control-${agent.name.toLowerCase().replace(/\s+/g, '-')}`;
       
       run(
-        `INSERT INTO openclaw_sessions (id, agent_id, openclaw_session_id, channel, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, agent.id, openclawSessionId, 'mission-control', 'active', now, now]
+        `INSERT INTO openclaw_sessions (id, agent_id, openclaw_session_id, channel, status, task_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, agent.id, openclawSessionId, 'mission-control', 'active', id, now, now]
       );
 
       session = queryOne<OpenClawSession>(
@@ -131,6 +131,11 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
         { error: 'Failed to create agent session' },
         { status: 500 }
       );
+    }
+
+    // Link task_id to the session so we can track which task the session is serving
+    if (session.task_id !== id) {
+      run('UPDATE openclaw_sessions SET task_id = ?, updated_at = ? WHERE id = ?', [id, now, session.id]);
     }
 
     // Build task message for agent

@@ -32,16 +32,20 @@
 
 ---
 
-## 🆕 What's New in v1.4.1 — Symphony Reliability Core
+## 🆕 What's New in v1.4.2 — Session Tracking & Smarter Stall Detection
 
-Inspired by [OpenAI's Symphony](https://github.com/openai/symphony), this release adds a durable execution layer under the existing UI:
+- **Session–Task Linking** — Dispatch now links `task_id` to the OpenClaw session, enabling accurate orphan cleanup and per-task session tracking
+- **Smarter Stall Detection** — Reconciler checks for an active OpenClaw session before flagging a task as stalled, eliminating false positives when agents are coding but haven't logged intermediate progress
+
+### v1.4.1 — Symphony Reliability Core
+
+Inspired by [OpenAI's Symphony](https://github.com/openai/symphony), v1.4.1 added a durable execution layer under the existing UI:
 
 - **Atomic Dispatch** — `dispatch_lock` prevents double-dispatch race conditions; optimistic locking on all status transitions
 - **Retry with Backoff** — Failed dispatches auto-retry with exponential backoff (10s → 5min, max 5 attempts)
 - **Reconciler Loop** — Background loop (30s) detects stalled tasks, retries failed dispatches, cleans up orphaned sessions, and drains queues
-- **WORKFLOW.md** — File-based workflow config with YAML front matter and hot-reload (Symphony's best idea). Define stages, fail targets, reconciler settings, and concurrency limits in a single versioned file
+- **WORKFLOW.md** — File-based workflow config with YAML front matter and hot-reload. Define stages, fail targets, reconciler settings, and concurrency limits in a single versioned file
 - **Bounded Concurrency** — `max_concurrent_tasks` (default 3) prevents overwhelming the agent gateway
-- **Validation Limits** — Description field limit raised to 50,000 characters
 
 See the full [CHANGELOG](CHANGELOG.md) for details.
 

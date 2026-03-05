@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.4.2] - 2026-03-05
+
+### Fixed
+- **Session–task linking** — Dispatch now sets `task_id` on the OpenClaw session record (both new and reused sessions). Fixes orphaned session cleanup and enables per-task session tracking.
+- **False stall detection** — Reconciler now checks for an active OpenClaw session linked to the task before flagging it as stalled. Previously, agents actively coding but not logging intermediate progress were incorrectly re-dispatched after 30 minutes.
+
+---
+
 ## [1.4.1] - 2026-03-05
 
 ### Added
@@ -225,6 +233,7 @@ This is the first stable, tested, and working release of Mission Control.
 
 ---
 
+[1.4.2]: https://github.com/crshdn/mission-control/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/crshdn/mission-control/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/crshdn/mission-control/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/crshdn/mission-control/releases/tag/v1.3.1
